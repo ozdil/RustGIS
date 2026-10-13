@@ -3640,6 +3640,7 @@ dependencies = [
  "csv",
  "flatgeobuf",
  "geozero",
+ "image",
  "miniz_oxide 0.8.9",
  "parquet",
  "proj4rs",

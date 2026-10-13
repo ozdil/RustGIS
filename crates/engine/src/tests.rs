@@ -2656,6 +2656,48 @@ fn mbtiles_archives_become_tile_layers() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A KMZ's ground overlays become raster layers kept in the project; a KML whose picture is a web
+/// address or outside its folder says so.
+#[test]
+fn kml_ground_overlays_become_rasters() {
+    use base64::Engine;
+    let mut red = tiny_skia::Pixmap::new(8, 8).unwrap();
+    red.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+    let doc = r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document>
+<Placemark><name>P</name><Point><coordinates>10.5,40.5</coordinates></Point></Placemark>
+<GroundOverlay><name>Red</name><Icon><href>files/red.png</href></Icon><LatLonBox><north>41</north><south>40</south><east>11</east><west>10</west><rotation>10</rotation></LatLonBox></GroundOverlay>
+<GroundOverlay><name>Quad</name><Icon><href>files/red.png</href></Icon></GroundOverlay>
+</Document></kml>"#;
+    let kmz = rustgis_data::zip::write(&[("doc.kml".into(), doc.as_bytes().to_vec()), ("files/red.png".into(), red.encode_png().unwrap())])
+        .unwrap();
+    let mut s = Session::new(Project::default());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&kmz);
+    let r = s.run("layer.addDataBytes", &json!({"fileName": "site.kmz", "data": b64})).unwrap();
+    assert_eq!(r["layers"].as_array().map(Vec::len), Some(2), "{r}");
+    let overlay = s.map().layer_by_name("Red").unwrap();
+    assert!(overlay.raster.as_ref().is_some_and(|r| r.data.is_some()));
+    assert!(s.notices.iter().any(|n| n.text.contains("1 ground overlays without a picture or a box")));
+    // The project keeps the picture.
+    let text = serde_json::to_string(&s.project).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.openText", &json!({"text": text})).unwrap();
+    assert!(t.map().layer_by_name("Red").and_then(|l| l.raster.as_ref()).is_some_and(|r| r.data.is_some()));
+    // A KML of overlays only, whose pictures aren't readable from where it is.
+    let dir = std::env::temp_dir().join(format!("rustgis-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let only = r#"<kml><GroundOverlay><name>Far</name><Icon><href>../secret.png</href></Icon><LatLonBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonBox></GroundOverlay>
+<GroundOverlay><name>Web</name><Icon><href>https://example.com/x.png</href></Icon><LatLonBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonBox></GroundOverlay>
+<GroundOverlay><name>Here</name><Icon><href>red.png</href></Icon><LatLonBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonBox></GroundOverlay></kml>"#;
+    std::fs::write(dir.join("o.kml"), only).unwrap();
+    std::fs::write(dir.join("red.png"), red.encode_png().unwrap()).unwrap();
+    let mut u = Session::new(Project::default());
+    u.run("layer.addData", &json!({"path": dir.join("o.kml").display().to_string()})).unwrap();
+    assert!(u.map().layer_by_name("Here").is_some());
+    assert!(u.map().layer_by_name("Far").is_none() && u.map().layer_by_name("Web").is_none());
+    assert!(u.notices.iter().any(|n| n.text.contains("Far (its picture ../secret.png isn't in the file or beside it)")));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn pmtiles_from_network_shares_are_refused() {
     let mut s = Session::new(Project::default());

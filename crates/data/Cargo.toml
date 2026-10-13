@@ -24,6 +24,8 @@ parquet = { workspace = true }
 bytes = { workspace = true }
 flatgeobuf = { workspace = true }
 geozero = { workspace = true }
+# KML ground overlays are PNG or JPEG pictures.
+image = { workspace = true, features = ["jpeg"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # zstd is C: native only. GeoParquet files compressed with it don't open in the browser yet.

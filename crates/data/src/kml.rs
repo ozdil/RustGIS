@@ -80,11 +80,83 @@ pub fn read(file_name: &str, bytes: &[u8]) -> Result<Vec<Layer>> {
         rows: Vec::new(),
         keys: Vec::new(),
         skipped: 0,
-        overlays: 0,
     };
     r.collect_styles(doc.root());
     r.walk(doc.root(), &mut Vec::new(), 0);
     Ok(r.layers(&name))
+}
+
+/// A ground overlay: a picture laid over a longitude/latitude box.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroundOverlay {
+    pub name: String,
+    /// The picture's address, as the document gives it (a path inside a KMZ, a file beside the
+    /// KML, or a web address).
+    pub href: String,
+    /// West, south, east, north.
+    pub bbox: [f64; 4],
+    /// Degrees counter-clockwise about the box's centre.
+    pub rotation: f64,
+}
+
+/// The ground overlays a document lays out, and how many it has that can't be drawn (a
+/// `gx:LatLonQuad`, no picture, a bad box). A KMZ's pictures are returned with them; other
+/// documents name theirs by `href` only.
+pub fn ground_overlays(file_name: &str, bytes: &[u8]) -> Result<(Vec<(GroundOverlay, Option<Vec<u8>>)>, usize)> {
+    let is_kmz = std::path::Path::new(file_name).extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("kmz"))
+        || bytes.starts_with(b"PK\x03\x04");
+    let budget = usize::try_from(crate::io::MAX_BYTES).unwrap_or(usize::MAX);
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let owned;
+    let (doc_bytes, doc_dir): (&[u8], String) = if is_kmz {
+        entries = crate::zip::read_matching_within(bytes, |_| true, budget).map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
+        let mut docs: Vec<&(String, Vec<u8>)> = entries.iter().filter(|(n, _)| n.to_ascii_lowercase().ends_with(".kml")).collect();
+        docs.sort_by_key(|(n, _)| (!n.eq_ignore_ascii_case("doc.kml"), n.matches('/').count(), n.clone()));
+        let (n, b) = docs.first().ok_or_else(|| DataError::Format(format!("{file_name}: no .kml document in the archive")))?;
+        owned = b.clone();
+        (&owned, n.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap_or_default())
+    } else {
+        (bytes, String::new())
+    };
+    let text = std::str::from_utf8(doc_bytes).map_err(|_| DataError::Format(format!("{file_name} is not UTF-8 text")))?;
+    let opts = ParsingOptions { allow_dtd: false, nodes_limit: crate::io::XML_NODES, ..ParsingOptions::default() };
+    let doc = Document::parse_with_options(text.trim_start_matches('\u{feff}'), opts)
+        .map_err(|e| DataError::Format(format!("{file_name}: {e}")))?;
+    let mut out = Vec::new();
+    let mut undrawn = 0usize;
+    for g in doc.descendants().filter(|n| n.is_element() && local(n) == "GroundOverlay").take(256) {
+        let href = g.descendants().find(|n| n.is_element() && local(n) == "Icon").and_then(|i| child_text(&i, "href"));
+        let bbox = g.descendants().find(|n| n.is_element() && local(n) == "LatLonBox").and_then(|b| {
+            let v = |k: &str| child_text(&b, k).and_then(|t| t.trim().parse::<f64>().ok()).filter(|x| x.is_finite());
+            let (n, s, e, w) = (v("north")?, v("south")?, v("east")?, v("west")?);
+            Some(([w, s, e, n], v("rotation").unwrap_or(0.0)))
+        });
+        let (Some(href), Some(([w, s, e, n], rotation))) = (href, bbox) else {
+            undrawn += 1;
+            continue;
+        };
+        if !(w < e
+            && s < n
+            && (-180.0..=180.0).contains(&w)
+            && (-180.0..=180.0).contains(&e)
+            && (-90.0..=90.0).contains(&s)
+            && (-90.0..=90.0).contains(&n))
+        {
+            undrawn += 1;
+            continue;
+        }
+        // A KMZ's picture, by its path relative to the document.
+        let picture = is_kmz.then(|| {
+            let want = format!("{doc_dir}{}", href.trim_start_matches("./"));
+            entries
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&want) || n.eq_ignore_ascii_case(href.trim_start_matches("./")))
+                .map(|(_, b)| b.clone())
+        });
+        let name = child_text(&g, "name").unwrap_or_else(|| "Ground overlay".into());
+        out.push((GroundOverlay { name, href, bbox: [w, s, e, n], rotation }, picture.flatten()));
+    }
+    Ok((out, undrawn))
 }
 
 /// One placemark, before it's put in a layer.
@@ -110,7 +182,6 @@ struct Reader {
     /// Extended data entries past the column cap.
     dropped_keys: usize,
     skipped: usize,
-    overlays: usize,
 }
 
 fn local<'a>(n: &Node<'a, '_>) -> &'a str {
@@ -297,7 +368,8 @@ impl Reader {
                     }
                 }
                 "Placemark" => self.placemark(&c, folders),
-                "GroundOverlay" => self.overlays += 1,
+                // Pictures, read by `ground_overlays`.
+                "GroundOverlay" => {}
                 "kml" => self.walk(c, folders, depth + 1),
                 _ => {}
             }
@@ -411,9 +483,6 @@ impl Reader {
                 if self.dropped_keys > 0 {
                     report.messages.push(format!("{name}: extended data past {MAX_KEYS} distinct names was left out"));
                 }
-                if self.overlays > 0 {
-                    report.messages.push(format!("{name}: {} ground overlays (images) aren't shown", self.overlays));
-                }
             }
             let styles = used.into_iter().filter_map(|id| self.styles.get(&id).map(|s| (id, *s))).collect();
             out.push(Layer { dataset: ds, report, styles });
@@ -470,7 +539,9 @@ mod tests {
         assert_eq!(pin.icon, Some([0, 0, 255, 255]));
         assert_eq!(pin.scale, Some(1.5));
         assert_eq!(pts.report.skipped, 1);
-        assert!(pts.report.messages.iter().any(|m| m.contains("ground overlays")));
+        // The ground overlay has no box: it can't be laid out.
+        let (overlays, undrawn) = ground_overlays("t.kml", DOC.as_bytes()).unwrap();
+        assert_eq!((overlays.len(), undrawn), (0, 1));
 
         let lines = &layers[1].dataset;
         assert_eq!(lines.features.len(), 2, "the route and the track");

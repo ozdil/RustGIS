@@ -116,6 +116,12 @@ fn band(p: &Value, k: &str, r: &Raster) -> Result<Option<usize>, String> {
 }
 
 /// Adds a raster as a new layer, selects it and returns its id.
+/// Adds a picture laid over the map (a KML ground overlay), kept in the project as a GeoTIFF.
+pub(crate) fn add_overlay(s: &mut Session, name: &str, r: raster::Raster) -> CmdResult {
+    let tif = raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
+    add_raster(s, name, RasterLayer::from_bytes(r, format!("{name}.tif"), tif))
+}
+
 pub fn add_raster(s: &mut Session, name: &str, layer: RasterLayer) -> CmdResult {
     let mut unique = name.to_string();
     let mut i = 1;

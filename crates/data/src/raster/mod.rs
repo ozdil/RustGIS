@@ -380,6 +380,84 @@ pub fn read_path(path: &Path) -> Result<Raster> {
     Ok(r)
 }
 
+/// A picture (PNG or JPEG) laid over a longitude/latitude box (west, south, east, north) and
+/// turned `rotation` degrees counter-clockwise about its centre: an RGBA raster, as a KML ground
+/// overlay is. Pictures are at most 8192 pixels a side.
+pub fn from_image(name: &str, bytes: &[u8], bbox: [f64; 4], rotation: f64) -> Result<Raster> {
+    let r = from_image_unrotated(name, bytes, bbox)?;
+    if !rotation.is_finite() || rotation.abs() < 1e-9 {
+        return Ok(r);
+    }
+    rotate(&r, rotation)
+}
+
+/// A raster turned about its centre (in its own coordinates): the turned rectangle's bounding box,
+/// at the same pixel size, its corners transparent (nearest pixel).
+fn rotate(r: &Raster, degrees: f64) -> Result<Raster> {
+    let (w, h) = (f64::from(r.width), f64::from(r.height));
+    let (sin, cos) = degrees.to_radians().sin_cos();
+    // The pixel grid is square in the picture; a turn in coordinates is a turn of the pixels
+    // scaled by the cell's aspect.
+    let (px, py) = (r.transform.pixel_width, -r.transform.pixel_height);
+    let (cx, cy) = (r.transform.origin_x + w * px / 2.0, r.transform.origin_y - h * py / 2.0);
+    let corners =
+        [(-w / 2.0 * px, -h / 2.0 * py), (w / 2.0 * px, -h / 2.0 * py), (w / 2.0 * px, h / 2.0 * py), (-w / 2.0 * px, h / 2.0 * py)];
+    let turned: Vec<(f64, f64)> = corners.iter().map(|(x, y)| (x * cos - y * sin, x * sin + y * cos)).collect();
+    let (min_x, max_x) = turned.iter().fold((f64::MAX, f64::MIN), |(a, b), (x, _)| (a.min(*x), b.max(*x)));
+    let (min_y, max_y) = turned.iter().fold((f64::MAX, f64::MIN), |(a, b), (_, y)| (a.min(*y), b.max(*y)));
+    let ow = ((max_x - min_x) / px).ceil().clamp(1.0, 16384.0) as u32;
+    let oh = ((max_y - min_y) / py).ceil().clamp(1.0, 16384.0) as u32;
+    let n = ow as usize * oh as usize;
+    let mut bands: Vec<Vec<f32>> = vec![vec![0.0; n]; r.bands.len()];
+    for row in 0..oh {
+        for col in 0..ow {
+            // The output pixel's centre, turned back into the picture.
+            let x = min_x + (f64::from(col) + 0.5) * px;
+            let y = max_y - (f64::from(row) + 0.5) * py;
+            let (sx, sy) = (x * cos + y * sin, -x * sin + y * cos);
+            let (c, rr) = ((sx / px + w / 2.0).floor(), (h / 2.0 - sy / py).floor());
+            if c < 0.0 || rr < 0.0 || c >= w || rr >= h {
+                continue;
+            }
+            let src = rr as usize * r.width as usize + c as usize;
+            let dst = row as usize * ow as usize + col as usize;
+            for (out, b) in bands.iter_mut().zip(&r.bands) {
+                if let (Some(o), Some(v)) = (out.get_mut(dst), b.data.get(src)) {
+                    *o = *v;
+                }
+            }
+        }
+    }
+    let transform = GeoTransform { origin_x: cx + min_x, origin_y: cy + max_y, pixel_width: px, pixel_height: -py };
+    Raster::new(r.name.clone(), ow, oh, bands, transform, r.crs, None, r.color.clone(), r.data_type.clone())
+}
+
+fn from_image_unrotated(name: &str, bytes: &[u8], bbox: [f64; 4]) -> Result<Raster> {
+    let [w, s, e, n] = bbox;
+    if !(w < e && s < n) {
+        return Err(DataError::Format(format!("{name}: an empty box")));
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| DataError::Format(format!("{name}: {e}")))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(512 << 20);
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| DataError::Format(format!("{name}: {e}")))?.into_rgba8();
+    let (width, height) = img.dimensions();
+    let mut bands: Vec<Vec<f32>> = (0..4).map(|_| Vec::with_capacity(width as usize * height as usize)).collect();
+    for px in img.pixels() {
+        for (b, v) in bands.iter_mut().zip(px.0) {
+            b.push(f32::from(v));
+        }
+    }
+    let transform =
+        GeoTransform { origin_x: w, origin_y: n, pixel_width: (e - w) / f64::from(width), pixel_height: -(n - s) / f64::from(height) };
+    Raster::new(name, width, height, bands, transform, Crs::LonLat, None, ColorHint::Rgb { alpha: true }, "UInt8")
+}
+
 /// Reads a raster from a file's name and bytes (a browser upload).
 pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     let p = Path::new(file_name);
@@ -413,6 +491,34 @@ pub fn read_prj(path: &Path) -> Option<String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A PNG of `w`×`h` pixels, red in its top half and blue below.
+    pub(crate) fn png(w: u32, h: u32) -> Vec<u8> {
+        let img =
+            image::RgbaImage::from_fn(w, h, |_, y| if y < h / 2 { image::Rgba([255, 0, 0, 255]) } else { image::Rgba([0, 0, 255, 255]) });
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn pictures_over_boxes() {
+        let r = from_image("o", &png(20, 10), [10.0, 40.0, 12.0, 41.0], 0.0).unwrap();
+        assert_eq!((r.width, r.height, r.bands.len()), (20, 10, 4));
+        let e = r.extent();
+        assert_eq!((e.min_x, e.min_y, e.max_x, e.max_y), (10.0, 40.0, 12.0, 41.0));
+        assert_eq!((r.bands[0].data[0], r.bands[2].data[199]), (255.0, 255.0), "red on top, blue below");
+        // A quarter turn: the box's centre stays, it is as tall as it was wide, and its corners
+        // (outside the picture) are see-through.
+        let t = from_image("o", &png(20, 10), [10.0, 40.0, 12.0, 41.0], 90.0).unwrap();
+        let e = t.extent();
+        assert!(((e.min_x + e.max_x) / 2.0 - 11.0).abs() < 0.11 && ((e.min_y + e.max_y) / 2.0 - 40.5).abs() < 0.11, "{e:?}");
+        assert!(((e.max_y - e.min_y) - 2.0).abs() < 0.11 && ((e.max_x - e.min_x) - 1.0).abs() < 0.11, "{e:?}");
+        let small = from_image("o", &png(20, 10), [10.0, 40.0, 12.0, 41.0], 30.0).unwrap();
+        assert_eq!(small.bands[3].data[0], 0.0, "a turned picture's corner is transparent");
+        assert!(from_image("o", b"not a picture", [0.0, 0.0, 1.0, 1.0], 0.0).is_err());
+        assert!(from_image("o", &png(2, 2), [1.0, 0.0, 0.0, 1.0], 0.0).is_err(), "an empty box");
+    }
 
     /// A 4×3 north-up lon/lat raster with one no-data pixel.
     pub(crate) fn small() -> Raster {
