@@ -1054,7 +1054,7 @@ pub fn url_file_name(url: &str, bytes: &[u8]) -> Result<String, String> {
 
 /// Downloads data from a web address and adds it (the command line, MCP and the assistant; the
 /// app downloads off the frame and adds the bytes).
-fn add_url(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn add_url(s: &mut Session, p: &Value) -> CmdResult {
     let url = ps(p, "url").map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://")) {

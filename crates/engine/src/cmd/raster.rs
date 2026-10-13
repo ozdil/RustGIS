@@ -162,7 +162,7 @@ fn add_bytes(s: &mut Session, p: &Value) -> CmdResult {
 pub(crate) fn add_named_bytes(s: &mut Session, p: &Value, name: String, bytes: Vec<u8>) -> CmdResult {
     if raster::is_raster_name(&name) {
         let r = raster::read_bytes(&name, &bytes).map_err(|e| format!("{name}: {e}"))?;
-        let title = r.name.clone();
+        let title = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).unwrap_or_else(|| r.name.clone());
         return add_raster(s, &title, RasterLayer::from_bytes(r, name, bytes));
     }
     // An MBTiles archive: held in memory and drawn as a tile layer.

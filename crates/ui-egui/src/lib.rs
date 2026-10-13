@@ -22,6 +22,7 @@ mod panes;
 mod pluginsui;
 mod reportpane;
 mod ribbon;
+mod stacui;
 mod table;
 pub mod theme;
 mod update;
@@ -216,6 +217,8 @@ pub struct UiState {
     /// Data downloading from web addresses (Add Data › From URL): the address, the parameters to
     /// add it with, and where the download lands.
     pub downloads: Vec<(u64, String, Value, Slot<Result<Vec<u8>, String>>)>,
+    /// STAC Search: its choices, results and the request under way.
+    pub stac: stacui::State,
     /// A layout picture waiting for its image file (web).
     pub pending_layout_picture: bool,
     /// The corners of a picture graphic waiting for its image file.
@@ -259,6 +262,7 @@ impl Default for UiState {
             pending_open: None,
             pending_csv: None,
             downloads: Vec::new(),
+            stac: Default::default(),
             hidden_tabs: Vec::new(),
             quick_access: Vec::new(),
             pane_sets: Vec::new(),
@@ -1555,6 +1559,7 @@ impl RustGisApp {
         rustgis_engine::plugins::set_language(self.lang().code());
         panes::poll_geolibre(self, ctx);
         self.poll_downloads();
+        stacui::poll(self, ctx);
         pluginsui::poll(self, ctx);
         assistantpane::poll(self, ctx);
         self.ensure_script_font();

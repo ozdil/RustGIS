@@ -15,6 +15,7 @@ pub mod mvt;
 pub mod pmtiles;
 pub mod source;
 pub mod sprite;
+pub mod stac;
 pub mod style;
 pub mod template;
 

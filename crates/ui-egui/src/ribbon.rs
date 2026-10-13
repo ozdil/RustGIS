@@ -388,6 +388,7 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
             menu_item(ui, app, "", "Data…", "ui.addData", Value::Null);
             menu_item(ui, app, "", "Delimited Text…", "ui.addDelimited", Value::Null);
             menu_item(ui, app, "", "From URL…", "ui.addUrl", Value::Null);
+            menu_item(ui, app, "", "STAC Search…", "ui.dialog", json!({"name": "stac"}));
             menu_item(ui, app, "graphics_layer", "Graphics Layer", "graphics.newLayer", Value::Null);
             ui.separator();
             ui.label(egui::RichText::new(tl!("Sample data (Natural Earth)")).small().weak());

@@ -22,6 +22,7 @@ pub mod report;
 pub mod select;
 pub mod share;
 pub mod sharing;
+pub mod stac;
 pub mod tiles;
 pub mod view;
 pub mod workflows;
@@ -59,6 +60,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(share::commands());
     v.extend(plugins::commands());
     v.extend(sharing::commands());
+    v.extend(stac::commands());
     v
 }
 

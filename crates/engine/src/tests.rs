@@ -408,6 +408,9 @@ fn hostile_params_never_panic() {
                 | "gp.installGeolibre"
                 | "plugin.registry"
                 | "plugin.installFromRegistry"
+                // Ask Earth Search when no API is given.
+                | "stac.collections"
+                | "stac.search"
         ) {
             continue;
         }
@@ -2984,4 +2987,89 @@ fn zipped_shapefiles_add_as_layers() {
     s.run("project.open", &json!({"path": project})).unwrap();
     assert_eq!(s.map().layers.len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Serves each request by the first route its path starts with (`{base}` in a body becomes the
+/// server's address; other paths are 404); returns the base address.
+fn serve_routes(routes: Vec<(&'static str, String)>, n: usize) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let b = base.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(n) {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let read = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..read]);
+            let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+            match routes.iter().find(|(p, _)| path.starts_with(p)) {
+                Some((_, body)) => {
+                    let body = body.replace("{base}", &b);
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                }
+                None => {
+                    let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            }
+        }
+    });
+    base
+}
+
+/// A STAC API (a local one): its collections, a search adding the footprints, and an item's
+/// asset added by its address; assets elsewhere than the web are refused by name.
+#[test]
+fn stac_search_and_assets() {
+    let item = r#"{"type": "Feature", "id": "S2_1", "collection": "s2", "bbox": [7, 46, 8, 47],
+        "geometry": {"type": "Polygon", "coordinates": [[[7, 46], [8, 46], [8, 47], [7, 47], [7, 46]]]},
+        "properties": {"datetime": "2024-06-02T10:30:00Z", "eo:cloud_cover": 3.5},
+        "links": [{"rel": "self", "href": "{base}/v1/collections/s2/items/S2_1"}],
+        "assets": {"places": {"href": "{base}/data/places.geojson", "type": "application/geo+json", "roles": ["data"]},
+                   "b04": {"href": "s3://bucket/B04.tif", "type": "image/tiff; application=geotiff", "roles": ["data"]}}}"#;
+    let geojson = r#"{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"n": 1}, "geometry": {"type": "Point", "coordinates": [7.5, 46.5]}}]}"#;
+    let base = serve_routes(
+        vec![
+            ("/v1/collections/s2/items/", item.to_string()),
+            ("/v1/collections", r#"{"collections": [{"id": "s2", "title": "Sentinel-2"}]}"#.to_string()),
+            (
+                "/v1/search",
+                format!(
+                    r#"{{"type": "FeatureCollection", "features": [{item}], "links": [{{"rel": "next", "href": "{{base}}/v1/search?page=2"}}]}}"#
+                ),
+            ),
+            ("/data/places.geojson", geojson.to_string()),
+        ],
+        6,
+    );
+    let api = format!("{base}/v1");
+    let mut s = Session::new(Project::default());
+    let r = s.run("stac.collections", &json!({"url": api})).unwrap();
+    assert_eq!(r["collections"][0]["id"], "s2");
+    let r = s.run("stac.search", &json!({"url": format!("{api}/search"), "collections": "s2", "bbox": [7, 46, 8, 47], "datetime": "2024-06-01/2024-06-30", "maxCloud": 20})).unwrap();
+    assert_eq!(r["count"], 1);
+    assert_eq!(r["next"], format!("{base}/v1/search?page=2"));
+    let l = s.map().layer_by_name("STAC footprints").unwrap();
+    assert_eq!(l.dataset.features.len(), 1);
+    assert_eq!(l.dataset.geometry_type, rustgis_data::GeometryType::Polygon);
+    // The item as the search gave it: its data asset (no visual one, no GeoTIFF on the web).
+    let found = r["items"][0].clone();
+    let e = s.run("stac.addAsset", &json!({"item": found, "asset": "b04"})).unwrap_err();
+    assert!(e.contains("s3://"), "{e}");
+    let r = s.run("stac.addAsset", &json!({"item": found})).unwrap();
+    assert_eq!(r["features"], 1, "{r}");
+    assert!(s.map().layer_by_name("S2_1 places").is_some());
+    // By the item's address.
+    s.run("stac.addAsset", &json!({"url": format!("{api}/collections/s2/items/S2_1"), "name": "Again"})).unwrap();
+    assert!(s.map().layer_by_name("Again").is_some());
+    for bad in [
+        json!({"url": api, "bbox": [0, 50, 1, 40]}),
+        json!({"url": api, "datetime": "last week"}),
+        json!({"url": "file:///etc"}),
+        json!({"item": 7}),
+        json!({"item": {"type": "Feature", "id": "x", "assets": {}}}),
+    ] {
+        assert!(s.run("stac.search", &bad).is_err() || s.run("stac.addAsset", &bad).is_err(), "{bad}");
+    }
+    assert!(s.run("stac.addAsset", &json!({"item": {"type": "Feature", "id": "x", "assets": {}}})).is_err());
 }
