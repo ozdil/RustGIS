@@ -39,6 +39,7 @@ impl Dialogs {
             "addTiles" => "addTiles",
             "addCsv" => "addCsv",
             "addUrl" => "addUrl",
+            "addService" => "addService",
             "exportLayer" => "exportLayer",
             other => return Err(format!("unknown dialog '{other}'")),
         };
@@ -102,6 +103,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "addTiles" => "Add Tile Layer",
         "addCsv" => "Add Delimited Text",
         "addUrl" => "Add Data From URL",
+        "addService" => "Add From Service",
         "exportLayer" => "Export Features",
         _ => "Rename Layer",
     };
@@ -111,7 +113,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
     egui::Window::new(tl!(title)).id(egui::Id::new("dialog")).open(&mut open).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, -40.0)).show(ctx, |ui| {
         ui.set_width(match which {
             "coordinateSystem" => 660.0,
-            "addTiles" | "addUrl" => 560.0,
+            "addTiles" | "addUrl" | "addService" => 560.0,
             _ => 440.0,
         });
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
@@ -141,6 +143,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "addTiles" => close = add_tiles(app, ui),
             "addCsv" => close = add_csv(app, ui),
             "addUrl" => close = add_url(app, ui),
+            "addService" => close = add_service(app, ui),
             "exportLayer" => close = export_layer(app, ui),
             "camera" => {
                 egui::Grid::new("cam").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
@@ -329,6 +332,133 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
         }
         app.run("ui.addDelimited", p).map(|_| ())
     })
+}
+
+/// Add From Service: a WMS, WMTS, WFS, OGC API Features or ArcGIS REST service by its address.
+/// Connect fetches its capabilities in the background; its layers are then listed, each with an
+/// Add button (map layers become tile layers, features are downloaded).
+/// How many of a service's layers Add From Service lists.
+const SHOWN_LAYERS: usize = 500;
+
+fn add_service(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    const KINDS: [(&str, &str); 6] = [
+        ("auto", "Automatic"),
+        ("wms", "WMS"),
+        ("wmts", "WMTS"),
+        ("wfs", "WFS"),
+        ("ogcapi", "OGC API Features"),
+        ("arcgis", "ArcGIS REST"),
+    ];
+    if app.dialogs.mode == "new" {
+        app.dialogs.mode = "auto";
+    }
+    ui.label(egui::RichText::new(tl!("A map or feature service's address: WMS, WMTS, WFS, OGC API Features, or an ArcGIS FeatureServer, MapServer, ImageServer or VectorTileServer.")).weak());
+    let mut connect = false;
+    egui::Grid::new("service").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        ui.label(tl!("Address"));
+        let r = ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text("https://…/wms").desired_width(420.0));
+        connect |= r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.end_row();
+        ui.label(tl!("Type"));
+        let shown = KINDS.iter().find(|(c, _)| *c == app.dialogs.mode).map(|(_, l)| tl!(*l).to_string()).unwrap_or_default();
+        egui::ComboBox::from_id_salt("service_kind").selected_text(shown).width(240.0).show_ui(ui, |ui| {
+            for (code, label) in KINDS {
+                ui.selectable_value(&mut app.dialogs.mode, code, tl!(label));
+            }
+        });
+        ui.end_row();
+    });
+    let t = Tokens::get(ui.ctx());
+    ui.horizontal(|ui| {
+        connect |= crate::widgets::dialog_button(ui, tl!("Connect"), Some(t.accent), vec2(96.0, 28.0)).clicked();
+    });
+    if connect {
+        let url = app.dialogs.text.trim().to_string();
+        app.dialogs.error = None;
+        app.dialogs.info = None;
+        if url.is_empty() {
+            app.dialogs.error = Some(tl!("Give the service's web address").to_string());
+        } else if let Err(e) = app.run("ui.addService", json!({"url": url, "type": app.dialogs.mode})) {
+            app.dialogs.error = Some(e);
+        }
+    }
+    // The service: connecting, an error, or its layers.
+    let mut add: Option<Value> = None;
+    if let Some(conn) = &app.ui.service {
+        ui.separator();
+        if let Some(e) = &conn.error {
+            ui.colored_label(t.red, e);
+        } else if let Some(v) = &conn.listing {
+            let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+            let title = v.get("title").and_then(Value::as_str).unwrap_or("");
+            // Borrowed, not cloned: the dialog draws every frame.
+            let none = Vec::new();
+            let layers = v.get("layers").and_then(Value::as_array).unwrap_or(&none);
+            ui.label(
+                egui::RichText::new(crate::i18n::fmt(
+                    "{kind} {title}: {count} layers",
+                    &[("kind", kind), ("title", title), ("count", &layers.len().to_string())],
+                ))
+                .strong(),
+            );
+            for n in v.get("notes").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str) {
+                ui.label(egui::RichText::new(n).small().weak());
+            }
+            if layers.len() > SHOWN_LAYERS {
+                ui.label(
+                    egui::RichText::new(crate::i18n::fmt("The first {n} are listed.", &[("n", &SHOWN_LAYERS.to_string())])).small().weak(),
+                );
+            }
+            egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                for l in layers.iter().take(SHOWN_LAYERS) {
+                    ui.horizontal(|ui| {
+                        if ui.small_button(tl!("Add")).clicked() {
+                            add = Some(l.clone());
+                        }
+                        let name = l.get("name").and_then(Value::as_str).unwrap_or("");
+                        ui.label(l.get("title").and_then(Value::as_str).unwrap_or(name)).on_hover_text(name);
+                        let what = match l.get("offer").and_then(|o| o.get("type")).and_then(Value::as_str) {
+                            Some("features") => tl!("features"),
+                            Some("style") => tl!("style"),
+                            _ => tl!("map"),
+                        };
+                        ui.label(egui::RichText::new(what).small().weak());
+                    });
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(crate::i18n::fmt("Connecting to {url}…", &[("url", &conn.url)]));
+            });
+        }
+    }
+    if let (Some(l), Some(conn)) = (add, &app.ui.service) {
+        let (url, kind, text) = (conn.url.clone(), conn.kind, conn.text.clone().unwrap_or_default());
+        let name = l.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+        let title = l.get("title").and_then(Value::as_str).unwrap_or(&name).to_string();
+        let offer = l.get("offer").cloned().unwrap_or_default();
+        // Features are downloaded in the background, as From URL… does; map layers are added now.
+        let r = if offer.get("type").and_then(Value::as_str) == Some("features") {
+            let items = offer.get("url").and_then(Value::as_str).unwrap_or("").to_string();
+            app.run("ui.addUrl", json!({"url": items, "name": title, "service": true})).map(|_| tl!("Downloading…"))
+        } else {
+            let mut p = json!({"url": url, "layer": name, "text": text});
+            if kind != "auto" {
+                p["type"] = json!(kind);
+            }
+            app.run("service.add", p).map(|_| tl!("Added"))
+        };
+        match r {
+            Ok(m) => app.dialogs.info = Some(format!("{m} {title}")),
+            Err(e) => app.dialogs.error = Some(e),
+        }
+        app.map.invalidate();
+    }
+    if let Some(i) = &app.dialogs.info {
+        ui.label(egui::RichText::new(i).small());
+    }
+    false
 }
 
 /// Add Data From URL: a file on the web, downloaded and added (a PMTiles archive is read in place).

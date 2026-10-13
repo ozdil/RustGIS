@@ -63,6 +63,24 @@ background. In the web app, where nothing may wait, it adds `.pmtiles` addresses
 come through the From URL… dialog (`ui.addUrl`). GeoJSON, CSV, KML and GPX files are read up to
 256 MB; larger downloads (GeoParquet, FlatGeobuf, GeoPackage, GeoTIFF) up to the limits above.
 
+## Map and feature services
+
+**Home › Add Data › From Service…** connects to a service by its address, lists what it offers from
+its capabilities, and adds a layer at a time (`service.layers` and `service.add` from scripts, the
+command line and MCP).
+
+| Service | What it lists | How a layer is added |
+| --- | --- | --- |
+| WMS 1.1.1 / 1.3.0 | Named layers offered in Web Mercator | A tile layer of GetMap images (PNG when the service offers it, else JPEG) |
+| WMTS | Layers whose tile matrix set is Web Mercator's pyramid | A tile layer from the tile template (or KVP GetTile) |
+| WFS 1.1 / 2.0 | Feature types | Their features downloaded as GeoJSON, in the output format the service names (up to 50,000) |
+| OGC API Features | Collections | Their items downloaded as GeoJSON |
+| ArcGIS REST | FeatureServer and MapServer layers; a MapServer's map; an ImageServer; a VectorTileServer | Layers queried as GeoJSON (up to the server's record limit); a map as its tile cache when it is Web Mercator's pyramid, else exported images; an ImageServer as exported images; a VectorTileServer as its MapLibre style |
+
+The type is guessed from the address (`?SERVICE=`, `/wmts`, `/wfs`, `/collections`, `/rest/services`…) or
+chosen. A service that asks for a token says so. In the web app the server must allow requests
+from web pages (CORS).
+
 ## SQL queries and DuckDB databases
 
 With [DuckDB](https://duckdb.org) installed (the `duckdb` program on the `PATH`, DuckDB 1.5 or

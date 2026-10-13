@@ -24,7 +24,7 @@ pub fn commands() -> Vec<C> {
             r#"{"url": "https://…/data.geojson|.csv|.parquet|.fgb|.gpkg|.zip|.kml|.kmz|.gpx|.tif (the format from the address, else the contents) | a .pmtiles archive", "name"?: text, "layer"?: "one layer of a zip, KML or GPX"}"#,
         ),
         C::new("layer.addDownload", "Add Downloaded Data", "Home › Add", add_download)
-            .params(r#"{"id": a download the app finished (Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool}"#),
+            .params(r#"{"id": a download the app finished (Add Data › From URL), "url": its address, "name"?: text, "layer"?: text, "zoom"?: bool, "service"?: bool (a service's features: their axes and paging are checked)}"#),
         C::new("layer.addEncodedPolyline", "Add Encoded Polyline", "Home › Add", add_encoded_polyline).params(
             r#"{"polyline": "encoded polyline text" | [texts] (one line each), "precision"?: 5 (Google) | 6 (OSRM, Valhalla), "name"?: text}"#,
         ),
@@ -1092,6 +1092,13 @@ fn add_download(s: &mut Session, p: &Value) -> CmdResult {
     let url = ps(p, "url").unwrap_or("data").to_string();
     let i = s.downloaded.iter().position(|(d, _)| *d == id).ok_or("no such download (it was dropped when another project opened)")?;
     let (_, bytes) = s.downloaded.remove(i);
+    // A service's features (Add From Service): its answer's axes and paging.
+    let bytes = if super::b(p, "service").unwrap_or(false) {
+        let label = ps(p, "name").unwrap_or(&url).to_string();
+        super::service::features_answer(s, &label, bytes)
+    } else {
+        bytes
+    };
     let name = url_file_name(&url, &bytes).map_err(|e| format!("{url}: {e}"))?;
     let mut r = super::raster::add_named_bytes(s, p, name, bytes)?;
     // `"zoom": true` zooms to everything added, whatever the map held (a link's data); `zoomed`

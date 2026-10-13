@@ -12,6 +12,7 @@ pub mod io;
 pub mod kml;
 pub mod landxml;
 pub mod mbtiles;
+pub mod ogc;
 pub mod query;
 pub mod raster;
 pub mod sheets;

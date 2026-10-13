@@ -20,6 +20,7 @@ pub mod project;
 pub mod raster;
 pub mod report;
 pub mod select;
+pub mod service;
 pub mod share;
 pub mod sharing;
 pub mod tiles;
@@ -36,6 +37,7 @@ pub fn all() -> Vec<CommandSpec> {
     v.extend(project::commands());
     v.extend(navigate::commands());
     v.extend(tiles::commands());
+    v.extend(service::commands());
     v.extend(layer::commands());
     v.extend(raster::commands());
     v.extend(select::commands());

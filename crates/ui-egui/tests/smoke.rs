@@ -466,3 +466,36 @@ fn data_from_a_web_address_lands_later() {
     assert!(h.state().session.notices.iter().any(|n| n.error && n.text.contains("never fetched")));
     assert!(h.state().ui.downloads.is_empty());
 }
+
+/// Add From Service connects in the background and lists the service's layers in the dialog.
+#[test]
+fn a_service_is_listed_when_its_capabilities_land() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let body = br#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink"><Service><Title>Local</Title></Service><Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="http://127.0.0.1/wms?"/></Get></HTTP></DCPType></GetMap></Request><Layer><CRS>EPSG:3857</CRS><Layer><Name>a</Name><Title>A</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+        for stream in listener.incoming().take(1) {
+            let Ok(mut s) = stream else { continue };
+            let mut buf = [0u8; 2048];
+            let _ = s.read(&mut buf);
+            let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = s.write_all(body);
+        }
+    });
+    let mut h = harness();
+    h.state_mut().run("ui.addService", json!(null)).unwrap();
+    h.step();
+    h.state_mut().run("ui.addService", json!({"url": format!("http://{addr}/wms"), "type": "wms"})).unwrap();
+    for _ in 0..100 {
+        h.step();
+        if h.state().ui.service.as_ref().is_some_and(|c| c.listing.is_some() || c.error.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let conn = h.state().ui.service.as_ref().unwrap();
+    assert_eq!(conn.error, None);
+    assert_eq!(conn.listing.as_ref().unwrap()["layers"][0]["name"], "a");
+    h.step();
+}

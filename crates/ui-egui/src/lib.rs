@@ -137,6 +137,20 @@ fn open_with_system(_: &std::path::Path) -> Result<(), String> {
     Err("printing needs the desktop app".into())
 }
 
+/// A map or feature service Add From Service connects to: its capabilities arrive in the
+/// background, then its layers are listed.
+pub struct ServiceConn {
+    pub url: String,
+    /// `wms`, `wmts`, `wfs`, `ogcapi`, `arcgis`, or `auto`.
+    pub kind: &'static str,
+    pub slot: Slot<Result<Vec<u8>, String>>,
+    /// The capabilities document, once it has arrived.
+    pub text: Option<String>,
+    /// What `service.layers` made of it.
+    pub listing: Option<Value>,
+    pub error: Option<String>,
+}
+
 /// Panes on the left of the map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeftPane {
@@ -219,6 +233,8 @@ pub struct UiState {
     /// A link's data (`?data=`) has zoomed the map: the first of its files to land with something
     /// to show does, whichever it is.
     pub link_zoomed: bool,
+    /// The service Add From Service is connected (or connecting) to.
+    pub service: Option<ServiceConn>,
     /// A layout picture waiting for its image file (web).
     pub pending_layout_picture: bool,
     /// The corners of a picture graphic waiting for its image file.
@@ -263,6 +279,7 @@ impl Default for UiState {
             pending_csv: None,
             downloads: Vec::new(),
             link_zoomed: false,
+            service: None,
             hidden_tabs: Vec::new(),
             quick_access: Vec::new(),
             pane_sets: Vec::new(),
@@ -935,9 +952,37 @@ impl RustGisApp {
                 if p.get("zoom").and_then(Value::as_bool) == Some(true) {
                     q["zoom"] = json!(true);
                 }
+                if p.get("service").and_then(Value::as_bool) == Some(true) {
+                    q["service"] = json!(true);
+                }
                 self.session.notify(i18n::fmt("Downloading {url}…", &[("url", &url)]), false);
                 let id = self.session.download_started();
                 self.ui.downloads.push((id, url, q, slot));
+            }
+            // A map or feature service: the dialog, then (with an address) its capabilities,
+            // fetched off the frame; the dialog lists its layers when they land.
+            "ui.addService" => {
+                let Some(url) = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()) else {
+                    return self.run("ui.dialog", json!({"name": "addService"}));
+                };
+                let kind: &'static str = match p.get("type").and_then(Value::as_str).unwrap_or("auto") {
+                    "wms" => "wms",
+                    "wmts" => "wmts",
+                    "wfs" => "wfs",
+                    "ogcapi" => "ogcapi",
+                    "arcgis" => "arcgis",
+                    _ => "auto",
+                };
+                let caps = rustgis_engine::data::ogc::capabilities_url(url, (kind != "auto").then_some(kind));
+                let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
+                let land = slot.clone();
+                rustgis_engine::render::rustgis_tiles::cache::download(
+                    &caps,
+                    Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
+                );
+                // The dialog shows the address connected to, however the connection was asked for.
+                self.dialogs.text = url.to_string();
+                self.ui.service = Some(ServiceConn { url: url.to_string(), kind, slot, text: None, listing: None, error: None });
             }
             "ui.addData" => {
                 if let Some(open) = &self.services.open_async {
@@ -1569,6 +1614,36 @@ impl RustGisApp {
         }
     }
 
+    /// Lists a service's layers once its capabilities have arrived.
+    fn poll_service(&mut self) {
+        let Some(conn) = &mut self.ui.service else { return };
+        let Some(r) = conn.slot.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+        match r {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let mut p = json!({"url": conn.url, "text": text});
+                if conn.kind != "auto" {
+                    p["type"] = json!(conn.kind);
+                }
+                conn.text = Some(text);
+                // Not `self.run`: an error belongs in the dialog, not the notices.
+                match self.session.run("service.layers", &p) {
+                    Ok(v) => {
+                        if let Some(c) = &mut self.ui.service {
+                            c.listing = Some(v);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(c) = &mut self.ui.service {
+                            c.error = Some(e);
+                        }
+                    }
+                }
+            }
+            Err(e) => conn.error = Some(if e.starts_with(&conn.url) { e } else { format!("{}: {e}", conn.url) }),
+        }
+    }
+
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
         // Fonts installed last frame are active now.
@@ -1577,6 +1652,7 @@ impl RustGisApp {
         rustgis_engine::plugins::set_language(self.lang().code());
         panes::poll_geolibre(self, ctx);
         self.poll_downloads();
+        self.poll_service();
         pluginsui::poll(self, ctx);
         assistantpane::poll(self, ctx);
         self.ensure_script_font();

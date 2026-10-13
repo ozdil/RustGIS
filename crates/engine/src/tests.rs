@@ -2864,6 +2864,56 @@ fn gdal_rasters_reopen_with_their_choices() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Services from their capabilities: a WMS layer becomes a tile layer, an OGC API collection's
+/// features are downloaded (from a local server); unknown layers and documents are refused.
+#[test]
+fn services_list_and_add_layers() {
+    const WMS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://maps.example.com/wms?"/></Get></HTTP></DCPType></GetMap></Request>
+<Layer><Title>Root</Title><CRS>EPSG:3857</CRS>
+<Layer queryable="1"><Name>roads</Name><Title>Roads</Title><EX_GeographicBoundingBox><westBoundLongitude>5</westBoundLongitude><eastBoundLongitude>15</eastBoundLongitude><southBoundLatitude>45</southBoundLatitude><northBoundLatitude>55</northBoundLatitude></EX_GeographicBoundingBox></Layer>
+</Layer></Capability></WMS_Capabilities>"#;
+    let mut s = Session::new(Project::default());
+    let url = "https://maps.example.com/wms";
+    let v = s.run("service.layers", &json!({"url": url, "text": WMS})).unwrap();
+    assert_eq!((v["kind"].as_str(), v["count"].as_u64()), (Some("WMS"), Some(1)));
+    assert_eq!(v["layers"][0]["offer"]["type"], "tiles");
+    s.run("service.add", &json!({"url": url, "layer": "Roads", "text": WMS})).unwrap();
+    let t = s.map().tiles.first().unwrap();
+    assert!(t.url.contains("LAYERS=roads") && t.url.contains("{bbox-epsg-3857}") && t.overlay, "{}", t.url);
+    assert!(s.run("service.add", &json!({"url": url, "layer": "nope", "text": WMS})).is_err());
+    assert!(s.run("service.layers", &json!({"url": url, "text": "<html>no</html>"})).is_err());
+    assert!(s.run("service.layers", &json!({"url": "file:///etc/x", "text": WMS})).is_err());
+    // An OGC API collection's features, downloaded from a local server.
+    const GEOJSON: &[u8] = br#"{"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"name": "Lake"}, "geometry": {"type": "Point", "coordinates": [10, 50]}}]}"#;
+    let base = serve(GEOJSON, 1);
+    let api = format!("{base}/collections");
+    let collections = format!(
+        r#"{{"collections": [{{"id": "lakes", "title": "Lakes", "links": [{{"rel": "items", "type": "application/geo+json", "href": "{base}/collections/lakes/items"}}]}}]}}"#
+    );
+    let r = s.run("service.add", &json!({"url": api, "layer": "lakes", "text": collections})).unwrap();
+    assert_eq!(r["features"], 1);
+    assert!(s.map().layer_by_name("Lakes").is_some());
+    // A document on the web can't send RustGIS into the local network.
+    let inward = WMS.replace("https://maps.example.com/wms?", "http://127.0.0.1:8080/wms?");
+    let v = s.run("service.layers", &json!({"url": url, "text": inward})).unwrap();
+    assert_eq!(v["count"], 0);
+    assert!(v["notes"].as_array().unwrap().iter().any(|n| n.as_str().is_some_and(|n| n.contains("won't fetch"))), "{v}");
+    assert!(s.run("service.add", &json!({"url": url, "layer": "roads", "text": inward})).is_err());
+    // A service's answer with latitude first (its crs says so) is turned round, and a page of a
+    // larger collection is pointed out.
+    const LAT_FIRST: &[u8] = br#"{"type": "FeatureCollection", "numberMatched": 9, "numberReturned": 1, "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [50, 10]}}], "crs": {"type": "name", "properties": {"name": "urn:ogc:def:crs:EPSG::4326"}}}"#;
+    let base = serve(LAT_FIRST, 1);
+    let collections = format!(
+        r#"{{"collections": [{{"id": "wells", "title": "Wells", "links": [{{"rel": "items", "href": "{base}/collections/wells/items"}}]}}]}}"#
+    );
+    s.run("service.add", &json!({"url": format!("{base}/collections"), "layer": "wells", "text": collections})).unwrap();
+    let e = s.map().layer_by_name("Wells").unwrap().extent();
+    assert!((e.min_x - 10.0).abs() < 1e-9 && (e.min_y - 50.0).abs() < 1e-9, "{e:?}");
+    assert!(s.notices.iter().any(|n| n.text.contains("1 of its 9 features")));
+}
+
 #[test]
 fn pmtiles_from_network_shares_are_refused() {
     let mut s = Session::new(Project::default());

@@ -189,17 +189,60 @@ pub fn join(base: &str, href: &str) -> String {
     if let Some(path) = href.strip_prefix("//") {
         return format!("{scheme}://{path}");
     }
+    // The path (with `.` and `..` resolved, RFC 3986) and what follows it.
+    let (href_path, tail) = match href.find(['?', '#']) {
+        Some(i) => (href.get(..i).unwrap_or(href), href.get(i..).unwrap_or("")),
+        None => (href, ""),
+    };
     if href.starts_with('/') {
-        return format!("{scheme}://{host}{href}");
+        return format!("{scheme}://{host}{}{tail}", remove_dots(href_path));
     }
     let path = rest.get(host_end..).unwrap_or("").split(['?', '#']).next().unwrap_or("");
     let dir = path.rfind('/').map_or("/", |i| path.get(..=i).unwrap_or("/"));
-    format!("{scheme}://{host}{dir}{href}")
+    format!("{scheme}://{host}{}{tail}", remove_dots(&format!("{dir}{href_path}")))
+}
+
+/// A path with its `.` and `..` segments resolved (never above the root).
+fn remove_dots(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let segments: Vec<&str> = path.split('/').collect();
+    let last = segments.len().saturating_sub(1);
+    for (i, seg) in segments.iter().enumerate() {
+        match *seg {
+            "." => {}
+            ".." => {
+                // The root's empty segment stays.
+                if out.len() > 1 {
+                    out.pop();
+                }
+            }
+            s => out.push(s),
+        }
+        // A path ending in `.` or `..` names a directory.
+        if i == last && matches!(*seg, "." | "..") {
+            out.push("");
+        }
+    }
+    out.join("/")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn joins_relative_addresses() {
+        let base = "https://x.org/a/b/styles/root.json";
+        assert_eq!(join(base, "../../"), "https://x.org/a/");
+        assert_eq!(join(base, "../sprites/sprite"), "https://x.org/a/b/sprites/sprite");
+        assert_eq!(join(base, "./tile/{z}/{y}/{x}.pbf?f=1"), "https://x.org/a/b/styles/tile/{z}/{y}/{x}.pbf?f=1");
+        assert_eq!(join(base, "../../../../../x"), "https://x.org/x", "never above the root");
+        assert_eq!(join(base, "/root/./y"), "https://x.org/root/y");
+        assert_eq!(
+            join("https://x.org/a/VectorTileServer/?f=json", "tile/{z}/{y}/{x}.pbf"),
+            "https://x.org/a/VectorTileServer/tile/{z}/{y}/{x}.pbf"
+        );
+    }
 
     #[test]
     fn expands_templates() {

@@ -174,6 +174,16 @@ pub fn resolve(spec: &Spec) -> Resolve {
                 return Resolve::Failed(format!("{u}: mapbox:// addresses need Mapbox's own library"));
             }
             let u = template::join(&base, &u);
+            // An ArcGIS vector tile service answers its TileJSON-like description as JSON only
+            // when asked (`?f=json`); its styles point at the service itself.
+            let u = if u.split(['?', '#']).next().unwrap_or(&u).trim_end_matches('/').to_ascii_lowercase().ends_with("/vectortileserver")
+                && !u.contains("f=json")
+            {
+                // With the slash, so the tile paths it gives resolve inside the service.
+                format!("{}/?f=json", u.split(['?', '#']).next().unwrap_or(&u).trim_end_matches('/'))
+            } else {
+                u
+            };
             // A style's TileJSON is the style's choice; a vector layer's is the user's.
             if let Err(e) = address::check(&u, (spec.kind == Kind::Style).then_some(base.as_str())) {
                 return Resolve::Failed(e);
