@@ -379,6 +379,16 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
                     }
                 }
             });
+            small(
+                ui,
+                app,
+                "search",
+                "Find Place",
+                "Find a place or an address by name (OpenStreetMap).",
+                "ui.dialog",
+                json!({"name": "findPlace"}),
+                false,
+            );
         });
     });
     bookmarks_group(app, ui);
@@ -387,6 +397,7 @@ fn home_tab(app: &mut RustGisApp, ui: &mut Ui) {
         big_menu(ui, app, "add_data", "Add\nData", "Add GeoJSON, CSV or Shapefile data to the map.", |ui, app| {
             menu_item(ui, app, "", "Data…", "ui.addData", Value::Null);
             menu_item(ui, app, "", "Delimited Text…", "ui.addDelimited", Value::Null);
+            menu_item(ui, app, "", "Geocode Addresses…", "ui.dialog", json!({"name": "geocode"}));
             menu_item(ui, app, "", "From URL…", "ui.addUrl", Value::Null);
             menu_item(ui, app, "graphics_layer", "Graphics Layer", "graphics.newLayer", Value::Null);
             ui.separator();

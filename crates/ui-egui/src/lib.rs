@@ -15,6 +15,7 @@ mod chrome;
 mod dialogs;
 mod docpanes;
 mod editpanes;
+mod geocodeui;
 pub mod icons;
 mod layoutview;
 mod mapview;
@@ -216,6 +217,8 @@ pub struct UiState {
     /// Data downloading from web addresses (Add Data › From URL): the address, the parameters to
     /// add it with, and where the download lands.
     pub downloads: Vec<(u64, String, Value, Slot<Result<Vec<u8>, String>>)>,
+    /// Find Place searches and Geocode Addresses runs under way.
+    pub geocode: geocodeui::State,
     /// A layout picture waiting for its image file (web).
     pub pending_layout_picture: bool,
     /// The corners of a picture graphic waiting for its image file.
@@ -259,6 +262,7 @@ impl Default for UiState {
             pending_open: None,
             pending_csv: None,
             downloads: Vec::new(),
+            geocode: Default::default(),
             hidden_tabs: Vec::new(),
             quick_access: Vec::new(),
             pane_sets: Vec::new(),
@@ -1535,6 +1539,7 @@ impl RustGisApp {
         rustgis_engine::plugins::set_language(self.lang().code());
         panes::poll_geolibre(self, ctx);
         self.poll_downloads();
+        geocodeui::poll(self, ctx);
         pluginsui::poll(self, ctx);
         assistantpane::poll(self, ctx);
         self.ensure_script_font();

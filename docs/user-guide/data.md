@@ -98,6 +98,29 @@ A query can read any file the app can and fetch any web address, so the [AI
 Assistant](assistant.md) asks before it runs one, and plugins need both the files and network
 permissions.
 
+## Geocoding addresses
+
+**Home › Add Data › Geocode Addresses…** (`layer.geocode`) turns a table's addresses into points:
+a CSV of addresses without coordinates is added as a standalone table, then each row's address
+fields (`"address"`: a field, or several such as street, city and country, joined with commas)
+are looked up, each distinct address once. The result is a new point layer holding every field
+plus `geocoded`, what the geocoder called the place; rows that weren't found stay in its table
+without a point.
+
+The geocoder is OpenStreetMap's public [Nominatim](https://nominatim.org) by default, or
+[Photon](https://photon.komoot.io) (`"provider": "photon"`). Their usage policies allow light
+use, so RustGIS sends them at most one request a second and 100 addresses a run; give `"url"` of
+a Nominatim or Photon server of your own for more (up to 10,000, with no wait between requests).
+In the app the requests go out in the background, one at a time, and the layer is added when the
+last answer lands; `layer.geocode` on the command line waits for them.
+
+```sh
+rustgis-cli run --cmd 'layer.addData={"path":"stores.csv"}' --cmd 'layer.geocode={"table":"stores","address":["street","city","country"]}'
+```
+
+The addresses are sent to the geocoder's server, so the [AI Assistant](assistant.md) asks before
+it geocodes, and plugins need the network permission.
+
 ## Large files
 
 GeoPackage, GeoParquet and FlatGeobuf files with more than 100,000 features are read in place

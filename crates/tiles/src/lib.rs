@@ -10,6 +10,7 @@
 pub mod address;
 pub mod cache;
 pub mod draw;
+pub mod geocode;
 pub mod mbtiles;
 pub mod mvt;
 pub mod pmtiles;

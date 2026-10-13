@@ -5,6 +5,7 @@ pub mod deeplearning;
 pub mod design;
 pub mod edit;
 pub mod effects;
+pub mod geocode;
 pub mod gp;
 pub mod graphics;
 pub mod imagery;
@@ -35,6 +36,7 @@ pub fn all() -> Vec<CommandSpec> {
     let mut v = Vec::new();
     v.extend(project::commands());
     v.extend(navigate::commands());
+    v.extend(geocode::commands());
     v.extend(tiles::commands());
     v.extend(layer::commands());
     v.extend(raster::commands());

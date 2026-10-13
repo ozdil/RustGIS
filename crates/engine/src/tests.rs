@@ -2935,3 +2935,40 @@ fn zipped_shapefiles_add_as_layers() {
     assert_eq!(s.map().layers.len(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Places found by name, and a table's addresses turned into points, through a geocoder of one's
+/// own (a local Nominatim answer here); the app's answers can be passed in instead.
+#[test]
+fn geocoding_places_and_addresses() {
+    use crate::render::rustgis_tiles::geocode::Geocoder;
+    const ANSWER: &[u8] = br#"[{"lat": "48.8584", "lon": "2.2945", "display_name": "Tour Eiffel, Paris", "boundingbox": ["48.857", "48.859", "2.293", "2.296"]}]"#;
+    let base = serve(ANSWER, 4);
+    let mut s = Session::new(Project::default());
+    let r = s.run("map.findPlace", &json!({"query": "Eiffel Tower", "url": base})).unwrap();
+    assert_eq!(r["count"], 1);
+    assert_eq!(r["places"][0]["name"], "Tour Eiffel, Paris");
+    assert!(s.run("map.findPlace", &json!({"query": " "})).is_err());
+    assert!(s.run("map.findPlace", &json!({"query": "x", "provider": "google"})).is_err());
+    // Two rows share an address, asked once; a row without one has no point.
+    let csv = "id,street,city\n1,Champ de Mars,Paris\n2,Champ de Mars,Paris\n3,5 Av. Anatole,Paris\n4,,\n";
+    s.run("layer.addDataText", &json!({"fileName": "sites.csv", "text": csv})).unwrap();
+    assert!(s.project.tables.iter().any(|t| t.name == "sites"), "a table of addresses");
+    let r = s.run("layer.geocode", &json!({"table": "sites", "address": ["street", "city"], "url": base})).unwrap();
+    assert_eq!((r["matched"].as_u64(), r["unmatched"].as_u64()), (Some(3), Some(1)), "{r}");
+    let l = s.map().layer_by_name("sites (geocoded)").unwrap();
+    assert_eq!(l.dataset.features.len(), 4);
+    assert_eq!(l.dataset.fields.last().unwrap().name, "geocoded");
+    assert!(l.dataset.features[3].geometry.is_none());
+    // The app's own answers: one address found, the other not.
+    let places = json!({"Champ de Mars, Paris": {"lon": 2.29, "lat": 48.85, "name": "Champ de Mars"}, "5 Av. Anatole, Paris": null});
+    let r = s.run("layer.geocode", &json!({"layer": "sites", "address": "street, city", "places": places, "name": "G"})).unwrap();
+    assert_eq!((r["matched"].as_u64(), r["unmatched"].as_u64()), (Some(2), Some(2)));
+    for bad in
+        [json!({"layer": "sites"}), json!({"layer": "sites", "address": "nope"}), json!({"layer": "sites", "address": "id", "places": 7})]
+    {
+        assert!(s.run("layer.geocode", &bad).is_err(), "{bad}");
+    }
+    // A public server takes a hundred addresses a run.
+    let g = Geocoder::new(None, None).unwrap();
+    assert!(crate::cmd::geocode::check_batch(&g, 101).unwrap_err().contains("100"));
+}

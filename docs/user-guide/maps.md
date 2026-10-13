@@ -11,6 +11,11 @@ has World, Europe, Africa, Americas and East Asia) and **Go To XY**, which pans 
 latitude. Type a scale in the status bar to jump to it. More navigation tools are under [View
 effects](#view-effects) below.
 
+**Find Place** (`map.findPlace`) looks up a place or an address by name with OpenStreetMap's
+[Nominatim](https://nominatim.org) (or a [Photon](https://photon.komoot.io) server, or a
+geocoder of your own given by its address) and zooms to the one picked. The search goes to that
+server over the network; see [Geocoding addresses](data.md#geocoding-addresses) for whole tables.
+
 ## Basemaps
 
 ![A MapLibre style from OpenFreeMap drawn over Paris, with the Basemap gallery listing the built-in basemaps and the web tile layer](https://assets.rustgis.app/images/tiles.webp)
