@@ -2553,6 +2553,11 @@ fn duckdb_queries_and_databases() {
     // Its layers are listed without adding them.
     let listed = s.run("info.fileLayers", &json!({"path": db.display().to_string()})).unwrap();
     assert_eq!(listed, json!({"count": 2, "layers": ["lakes", "towns"]}));
+    // The database commands take a DuckDB file too.
+    let listed = s.run("info.databaseTables", &json!({"database": db.display().to_string()})).unwrap();
+    assert_eq!(listed, json!({"count": 2, "layers": ["lakes", "towns"]}));
+    let r = s.run("layer.addDatabase", &json!({"database": db.display().to_string(), "layer": "lakes", "name": "L"})).unwrap();
+    assert_eq!(r["features"], 1);
     // A query over the database's tables.
     let r = s.run("layer.addSql", &json!({"sql": "SELECT * FROM towns", "database": db.display().to_string(), "name": "Q"})).unwrap();
     assert_eq!(r["features"], 1);
@@ -2564,6 +2569,35 @@ fn duckdb_queries_and_databases() {
     let e = s.map().layer(r["layer"].as_u64().unwrap() as u32).unwrap().extent();
     assert!((e.min_x - 15.0).abs() < 0.01 && (e.min_y - 37.95).abs() < 0.05, "{e:?}");
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// PostgreSQL/PostGIS through DuckDB, when RUSTGIS_TEST_POSTGRES names a database with a
+/// password (`postgres:host=… dbname=… user=… password=…`) holding a PostGIS table.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn postgres_databases() {
+    let Ok(conn) = std::env::var("RUSTGIS_TEST_POSTGRES") else { return };
+    if !rustgis_data::source::duckdb::available() {
+        return;
+    }
+    let mut s = Session::new(Project::default());
+    let listed = s.run("info.databaseTables", &json!({"database": conn})).unwrap();
+    let first = listed["layers"][0].as_str().unwrap().to_string();
+    let r = s.run("layer.addDatabase", &json!({"database": conn, "layer": first, "name": "P", "stream": true})).unwrap();
+    assert!(r["features"].as_u64().unwrap() > 0, "{r}");
+    let id = r["layer"].as_u64().unwrap() as u32;
+    let src = s.map().layer(id).unwrap().source.clone().unwrap();
+    // The project names the connection without its password, and converts the table again.
+    let text = serde_json::to_string(&s.project).unwrap();
+    assert!(text.contains("postgres:") && !text.contains("password"), "{text}");
+    std::fs::remove_file(src.path.as_deref().unwrap()).unwrap();
+    let mut t = Session::new(Project::default());
+    t.run("project.openText", &json!({"text": text})).unwrap();
+    let again = t.map().layer_by_name("P").unwrap().source.as_ref().unwrap();
+    assert!(again.is_open(), "{:?}", again.error);
+    // A query over the database's tables.
+    let r = s.run("layer.addSql", &json!({"sql": format!("SELECT * FROM {first} LIMIT 3"), "database": conn, "name": "Q"})).unwrap();
+    assert!(r["features"].as_u64().unwrap() <= 3, "{r}");
 }
 
 #[test]

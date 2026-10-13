@@ -41,6 +41,117 @@ const KEEP: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600)
 /// The column added to sort rows into geometry families; never in a result.
 const DIM: &str = "__rustgis_dim";
 
+/// A database DuckDB reads: a DuckDB file, or a PostgreSQL database (PostGIS geometry included)
+/// through DuckDB's `postgres` extension.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Database {
+    File(PathBuf),
+    /// A libpq connection string (`host=… dbname=… user=…`) or `postgresql://` URI, without its
+    /// password (see [`remember_password`]).
+    Postgres(String),
+}
+
+impl Database {
+    /// A database by how projects and commands name it: `postgres:<connection string>`, a
+    /// `postgresql://` URI, or a file path. A password in it is taken out and remembered for the
+    /// session.
+    pub fn parse(s: &str) -> Database {
+        let t = s.trim();
+        let lower = t.to_ascii_lowercase();
+        let dsn = if let Some(rest) =
+            t.get(..9).filter(|p| p.eq_ignore_ascii_case("postgres:")).and_then(|_| t.get(9..)).filter(|r| !r.starts_with("//"))
+        {
+            Some(rest.trim().to_string())
+        } else if lower.starts_with("postgresql://") || lower.starts_with("postgres://") {
+            Some(t.to_string())
+        } else {
+            None
+        };
+        match dsn {
+            Some(d) => {
+                let (public, password) = split_password(&d);
+                if let Some(p) = password {
+                    remember_password(&public, &p);
+                }
+                Database::Postgres(public)
+            }
+            None => Database::File(PathBuf::from(t)),
+        }
+    }
+
+    /// How projects save it (never with a password).
+    pub fn label(&self) -> String {
+        match self {
+            Database::File(p) => p.display().to_string(),
+            Database::Postgres(d) if d.contains("://") => d.clone(),
+            Database::Postgres(d) => format!("postgres:{d}"),
+        }
+    }
+
+    /// What a layer's name and messages call it: the file, or the database and host.
+    pub fn short(&self) -> String {
+        match self {
+            Database::File(p) => p.file_stem().and_then(|s| s.to_str()).unwrap_or("database").to_string(),
+            Database::Postgres(d) => {
+                let get = |k: &str| d.split_whitespace().find_map(|kv| kv.strip_prefix(&format!("{k}=")).map(str::to_string));
+                get("dbname")
+                    .unwrap_or_else(|| d.rsplit('/').next().unwrap_or("postgres").split('?').next().unwrap_or("postgres").to_string())
+            }
+        }
+    }
+}
+
+/// A connection string without its password, and the password.
+fn split_password(dsn: &str) -> (String, Option<String>) {
+    let lower = dsn.to_ascii_lowercase();
+    if lower.starts_with("postgresql://") || lower.starts_with("postgres://") {
+        // scheme://user:password@host…
+        if let Some((scheme, rest)) = dsn.split_once("://")
+            && let Some((auth, host)) = rest.split_once('@')
+            && let Some((user, password)) = auth.split_once(':')
+        {
+            return (format!("{scheme}://{user}@{host}"), Some(password.to_string()));
+        }
+        return (dsn.to_string(), None);
+    }
+    let mut password = None;
+    let kept: Vec<&str> = dsn
+        .split_whitespace()
+        .filter(|kv| match kv.strip_prefix("password=") {
+            Some(p) => {
+                password = Some(p.trim_matches('\'').to_string());
+                false
+            }
+            None => true,
+        })
+        .collect();
+    (kept.join(" "), password)
+}
+
+fn passwords() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
+    P.get_or_init(Default::default)
+}
+
+/// Remembers a connection's password for this session (never saved: projects name connections
+/// without them, and libpq's `PGPASSWORD` or `~/.pgpass` serve when it isn't remembered).
+pub fn remember_password(dsn: &str, password: &str) {
+    passwords().lock().unwrap_or_else(|e| e.into_inner()).insert(dsn.to_string(), password.to_string());
+}
+
+/// The remembered password of a query's database, handed to DuckDB's PostgreSQL client in its
+/// environment (`PGPASSWORD`): never in the script, where the process list and DuckDB's errors
+/// would show it.
+fn password(database: Option<&Database>) -> Option<String> {
+    match database? {
+        Database::Postgres(dsn) => passwords().lock().unwrap_or_else(|e| e.into_inner()).get(dsn).cloned(),
+        Database::File(_) => None,
+    }
+}
+
+/// The error of a query (or table) without rows.
+pub const NO_ROWS: &str = "the query returned no rows";
+
 /// Whether a file name is a DuckDB database.
 pub fn is_duckdb_name(name: &str) -> bool {
     let ext = Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -74,8 +185,8 @@ pub fn cache_dir() -> Option<PathBuf> {
 pub struct Query<'a> {
     /// One SELECT statement (or `FROM …`, `WITH …`, `VALUES …`).
     pub sql: &'a str,
-    /// A DuckDB database opened (read only) for the query, so its tables are named plainly.
-    pub database: Option<&'a Path>,
+    /// A database opened (read only) for the query, so its tables are named plainly.
+    pub database: Option<&'a Database>,
     /// The coordinate system of a geometry column that doesn't say its own (`EPSG:2263`).
     pub crs: Option<&'a str>,
 }
@@ -140,18 +251,25 @@ fn check_crs(crs: Option<&str>) -> Result<()> {
 /// `confined` shuts DuckDB out of every file and web address but the cache folder once the
 /// database is open: a database file is hostile input, and its views can hold any SQL. Tables are
 /// read that way, so adding a database (or a project naming one) reads nothing else.
-fn prelude(dir: &Path, database: Option<&Path>, confined: bool) -> Result<String> {
+fn prelude(dir: &Path, database: Option<&Database>, confined: bool) -> Result<String> {
     let tmp = dir.join("spill");
     let mut s = format!(
         "INSTALL spatial; LOAD spatial; SET geometry_always_xy = true; SET enable_progress_bar = false; SET temp_directory = {};",
         literal(&tmp.display().to_string())
     );
-    if let Some(db) = database {
-        let full = std::path::absolute(db).unwrap_or_else(|_| db.to_path_buf());
-        if !full.is_file() {
-            return Err(DataError::Format(format!("{}: no such database", db.display())));
+    match database {
+        Some(Database::File(db)) => {
+            let full = std::path::absolute(db).unwrap_or_else(|_| db.to_path_buf());
+            if !full.is_file() {
+                return Err(DataError::Format(format!("{}: no such database", db.display())));
+            }
+            s.push_str(&format!(" ATTACH {} AS src (READ_ONLY); USE src;", literal(&full.display().to_string())));
         }
-        s.push_str(&format!(" ATTACH {} AS src (READ_ONLY); USE src;", literal(&full.display().to_string())));
+        // PostGIS geometry columns come through as DuckDB geometries with their coordinate system.
+        Some(Database::Postgres(dsn)) => {
+            s.push_str(&format!(" INSTALL postgres; LOAD postgres; ATTACH {} AS src (TYPE postgres, READ_ONLY); USE src;", literal(dsn)));
+        }
+        None => {}
     }
     if confined {
         let allowed = format!("{}{}", dir.display(), std::path::MAIN_SEPARATOR);
@@ -164,7 +282,7 @@ fn prelude(dir: &Path, database: Option<&Path>, confined: bool) -> Result<String
 }
 
 /// Runs a script.
-fn run_script(dir: &Path, script: &str, timeout: std::time::Duration) -> Result<()> {
+fn run_script(dir: &Path, script: &str, database: Option<&Database>, timeout: std::time::Duration) -> Result<()> {
     let duckdb = program().ok_or_else(missing)?;
     // An empty start-up file, so the user's own (~/.duckdbrc) can't change what runs.
     let init = dir.join("init.sql");
@@ -173,6 +291,9 @@ fn run_script(dir: &Path, script: &str, timeout: std::time::Duration) -> Result<
     }
     let mut c = Command::new(duckdb);
     c.arg("-init").arg(&init).arg("-c").arg(script);
+    if let Some(p) = password(database) {
+        c.env("PGPASSWORD", p);
+    }
     let out = output(c, timeout, "DuckDB")?;
     if !out.status.success() {
         return Err(DataError::Format(format!("DuckDB: {}", message(&String::from_utf8_lossy(&out.stderr), &out.status))));
@@ -182,13 +303,13 @@ fn run_script(dir: &Path, script: &str, timeout: std::time::Duration) -> Result<
 
 /// Runs `script`, then `select`, whose rows DuckDB writes to a file that is read back: not taken
 /// from what it prints, which warnings share.
-fn fetch(dir: &Path, script: &str, select: &str, timeout: std::time::Duration) -> Result<serde_json::Value> {
+fn fetch(dir: &Path, script: &str, database: Option<&Database>, select: &str, timeout: std::time::Duration) -> Result<serde_json::Value> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let file = dir.join(format!("{:016x}.{}.{n}.rows.tmp.json", fnv1a(select.as_bytes()), std::process::id()));
     let _guard = TempFile(Some(file.clone()));
     let copy = format!("{script} COPY ({select}) TO {} (FORMAT json, ARRAY true);", literal(&file.display().to_string()));
-    run_script(dir, &copy, timeout)?;
+    run_script(dir, &copy, database, timeout)?;
     serde_json::from_slice(&std::fs::read(&file)?).map_err(|e| DataError::Format(format!("DuckDB: unreadable result ({e})")))
 }
 
@@ -311,7 +432,8 @@ fn run_in(dir: &Path, q: &Query<'_>, confined: bool) -> Result<Output> {
     let from = format!("query({})", literal(sql));
 
     // The result's columns, from DuckDB binding the query (not running it).
-    let described = fetch(dir, &prelude, &format!("SELECT column_name, column_type FROM (DESCRIBE FROM {from})"), QUERY_TIMEOUT)?;
+    let described =
+        fetch(dir, &prelude, q.database, &format!("SELECT column_name, column_type FROM (DESCRIBE FROM {from})"), QUERY_TIMEOUT)?;
     let columns: Vec<Column> = described
         .as_array()
         .into_iter()
@@ -349,7 +471,8 @@ fn run_in(dir: &Path, q: &Query<'_>, confined: bool) -> Result<Output> {
             literal(&tmp(f).display().to_string())
         ));
     }
-    let counts = fetch(dir, &script, &format!("SELECT {DIM} AS dim, count(*)::BIGINT AS n FROM r GROUP BY ALL"), QUERY_TIMEOUT)?;
+    let counts =
+        fetch(dir, &script, q.database, &format!("SELECT {DIM} AS dim, count(*)::BIGINT AS n FROM r GROUP BY ALL"), QUERY_TIMEOUT)?;
 
     let mut out = Output::default();
     for row in counts.as_array().into_iter().flatten() {
@@ -368,7 +491,7 @@ fn run_in(dir: &Path, q: &Query<'_>, confined: bool) -> Result<Output> {
         return Err(DataError::Format(if out.skipped > 0 {
             format!("none of the query's {} rows has a geometry", out.skipped)
         } else {
-            "the query returned no rows".into()
+            NO_ROWS.into()
         }));
     }
     // The parts take their final names; the families not in the result are removed with their
@@ -395,11 +518,16 @@ fn dimension(f: Family) -> i64 {
 /// The tables (and views) of a database that have a geometry column. Read confined: a view
 /// reaching outside the database fails when it is converted.
 pub fn tables(database: &Path) -> Result<Vec<Table>> {
+    tables_of(&Database::File(database.to_path_buf()))
+}
+
+/// The tables (and views) of a database, file or connection, that have a geometry column.
+pub fn tables_of(database: &Database) -> Result<Vec<Table>> {
     let dir = cache_dir().ok_or_else(|| DataError::Format("no cache folder for DuckDB results".into()))?;
     tables_in(&dir, database)
 }
 
-fn tables_in(dir: &Path, database: &Path) -> Result<Vec<Table>> {
+fn tables_in(dir: &Path, database: &Database) -> Result<Vec<Table>> {
     if !available() {
         return Err(missing());
     }
@@ -407,7 +535,7 @@ fn tables_in(dir: &Path, database: &Path) -> Result<Vec<Table>> {
     let select = format!(
         "SELECT DISTINCT schema_name, table_name FROM duckdb_columns() WHERE database_name = 'src' AND starts_with(data_type, 'GEOMETRY') ORDER BY ALL LIMIT {LIST_LIMIT}"
     );
-    let rows = fetch(dir, &prelude(dir, Some(database), true)?, &select, LIST_TIMEOUT)?;
+    let rows = fetch(dir, &prelude(dir, Some(database), true)?, Some(database), &select, LIST_TIMEOUT)?;
     Ok(rows
         .as_array()
         .into_iter()
@@ -420,7 +548,12 @@ fn tables_in(dir: &Path, database: &Path) -> Result<Vec<Table>> {
 
 /// The table of a database named `name` (`table` or `schema.table`, any case).
 pub fn find_table(database: &Path, name: &str) -> Result<Table> {
-    let all = tables(database)?;
+    find_table_of(&Database::File(database.to_path_buf()), name)
+}
+
+/// The table of a database, file or connection, named `name`.
+pub fn find_table_of(database: &Database, name: &str) -> Result<Table> {
+    let all = tables_of(database)?;
     all.into_iter()
         .find(|t| t.label().eq_ignore_ascii_case(name) || t.name.eq_ignore_ascii_case(name))
         .ok_or_else(|| DataError::Format(format!("no table '{name}' with a geometry column")))
@@ -428,8 +561,23 @@ pub fn find_table(database: &Path, name: &str) -> Result<Table> {
 
 /// Converts a table of a database, reusing an earlier conversion while the file is unchanged.
 pub fn convert_table(database: &Path, table: &Table, crs: Option<&str>) -> Result<Output> {
+    convert_table_of(&Database::File(database.to_path_buf()), table, crs)
+}
+
+/// Converts a table of a database: a file's as [`convert_table`] does; a connection's afresh each
+/// time (its data may change at any time).
+pub fn convert_table_of(database: &Database, table: &Table, crs: Option<&str>) -> Result<Output> {
     let dir = cache_dir().ok_or_else(|| DataError::Format("no cache folder for DuckDB results".into()))?;
-    convert_table_in(&dir, database, table, crs)
+    match database {
+        Database::File(p) => convert_table_in(&dir, p, table, crs),
+        Database::Postgres(_) => {
+            if !available() {
+                return Err(missing());
+            }
+            std::fs::create_dir_all(&dir)?;
+            run_in(&dir, &Query { sql: &table.sql(), database: Some(database), crs }, true)
+        }
+    }
 }
 
 fn convert_table_in(dir: &Path, database: &Path, table: &Table, crs: Option<&str>) -> Result<Output> {
@@ -453,7 +601,7 @@ fn convert_table_in(dir: &Path, database: &Path, table: &Table, crs: Option<&str
     }
     let _ = std::fs::remove_file(&keyfile);
     // A database is hostile input: its tables are read confined to the cache.
-    let out = run_in(dir, &Query { sql: &table.sql(), database: Some(&full), crs }, true)?;
+    let out = run_in(dir, &Query { sql: &table.sql(), database: Some(&Database::File(full.clone())), crs }, true)?;
     // The key goes last, vouching for the parts written before it: the key, then a line per part
     // (its family, rows and file) and the rows left out.
     let mut text = key.clone();
@@ -513,6 +661,28 @@ fn ours(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn databases_by_name() {
+        assert_eq!(Database::parse(" places.duckdb "), Database::File("places.duckdb".into()));
+        // A password is taken out of the connection string, remembered and never in its label.
+        let d = Database::parse("postgres:host=db.example dbname=gis user=me password=pw1");
+        assert_eq!(d, Database::Postgres("host=db.example dbname=gis user=me".into()));
+        assert_eq!(d.label(), "postgres:host=db.example dbname=gis user=me");
+        assert_eq!(d.short(), "gis");
+        assert_eq!(password(Some(&d)).as_deref(), Some("pw1"));
+        assert_eq!(Database::parse(&d.label()), d);
+        let u = Database::parse("postgresql://me:pw2@db.example:5433/osm?sslmode=require");
+        assert_eq!(u, Database::Postgres("postgresql://me@db.example:5433/osm?sslmode=require".into()));
+        assert_eq!((u.label().as_str(), u.short().as_str()), ("postgresql://me@db.example:5433/osm?sslmode=require", "osm"));
+        assert_eq!(password(Some(&u)).as_deref(), Some("pw2"));
+        assert_eq!(Database::parse("POSTGRES:dbname=x"), Database::Postgres("dbname=x".into()));
+        assert_eq!(password(Some(&Database::parse("postgres:dbname=other"))), None);
+        // A connection is attached read only, its password never in the script.
+        let dir = std::env::temp_dir();
+        let p = prelude(&dir, Some(&d), true).unwrap();
+        assert!(p.contains("ATTACH 'host=db.example dbname=gis user=me' AS src (TYPE postgres, READ_ONLY)") && !p.contains("pw1"), "{p}");
+    }
 
     #[test]
     fn names_and_quoting() {
@@ -647,7 +817,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(st.success());
-        let tables = tables_in(&cache, &db).unwrap();
+        let tables = tables_in(&cache, &Database::File(db.clone())).unwrap();
         assert_eq!(tables.iter().map(Table::label).collect::<Vec<_>>(), vec!["leak", "pts", "s2.polys"]);
         // A view reaching outside the database is refused: tables are read confined to the cache.
         let e = convert_table_in(&cache, &db, &tables[0], None).unwrap_err().to_string();
@@ -667,7 +837,7 @@ mod tests {
         let key = std::fs::read_dir(&cache).unwrap().flatten().find(|e| e.file_name().to_string_lossy().ends_with(".key")).unwrap();
         assert!(std::fs::read_to_string(key.path()).unwrap().contains("part points 1000 "));
         // A query naming the database's tables plainly.
-        let q = Query { sql: "SELECT * FROM pts WHERE id < 10", database: Some(&db), crs: None };
+        let q = Query { sql: "SELECT * FROM pts WHERE id < 10", database: Some(&Database::File(db.clone())), crs: None };
         assert_eq!(run_in(&cache, &q, false).unwrap().parts[0].count, 10);
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -208,6 +208,9 @@ const PLACE_KEYS: &[&str] = &["path", "folder", "dir", "file", "url", "uri", "so
 /// The command running an SQL query through DuckDB, which can read any file and web address.
 pub const SQL: &str = "layer.addSql";
 
+/// Commands that read a database, which can be a PostgreSQL server's as well as a file.
+const DATABASES: &[&str] = &[SQL, "layer.addDatabase", "info.databaseTables"];
+
 /// What a command reaches beyond the project when run with some parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach {
@@ -237,7 +240,7 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     if super::tiles::NETWORK.contains(&spec.id) {
         return Some(Reach::Network);
     }
-    if spec.id == SQL {
+    if DATABASES.contains(&spec.id) {
         return Some(Reach::Files);
     }
     let files = super::items::names_place(params, PLACE_KEYS, 0)
@@ -253,8 +256,8 @@ fn refused(plugin: &Plugin, spec: &C, params: &Value) -> Option<String> {
     if user_only(spec.id) {
         return Some(format!("plugins can't run '{}'", spec.id));
     }
-    // An SQL query reads files and web addresses alike.
-    if spec.id == SQL && !(m.has(Permission::Files) && m.has(Permission::Network)) {
+    // An SQL query reads files and web addresses alike, and a database is a file or a server.
+    if DATABASES.contains(&spec.id) && !(m.has(Permission::Files) && m.has(Permission::Network)) {
         return Some(format!("{} needs the 'files' and 'network' permissions to run '{}'", m.name, spec.id));
     }
     match reaches(spec, params) {

@@ -20,6 +20,8 @@ pub struct Dialogs {
     pub flag: bool,
     pub error: Option<String>,
     pub info: Option<String>,
+    /// Choices found for the dialog (Add From Database's tables).
+    pub list: Vec<String>,
 }
 
 impl Dialogs {
@@ -38,6 +40,7 @@ impl Dialogs {
             "camera" => "camera",
             "addTiles" => "addTiles",
             "addCsv" => "addCsv",
+            "addDatabase" => "addDatabase",
             "exportLayer" => "exportLayer",
             other => return Err(format!("unknown dialog '{other}'")),
         };
@@ -100,6 +103,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         "camera" => "Camera",
         "addTiles" => "Add Tile Layer",
         "addCsv" => "Add Delimited Text",
+        "addDatabase" => "Add From Database",
         "exportLayer" => "Export Features",
         _ => "Rename Layer",
     };
@@ -138,6 +142,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             "coordinateSystem" => close = coordinate_system(app, ui, &t),
             "addTiles" => close = add_tiles(app, ui),
             "addCsv" => close = add_csv(app, ui),
+            "addDatabase" => close = add_database(app, ui),
             "exportLayer" => close = export_layer(app, ui),
             "camera" => {
                 egui::Grid::new("cam").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
@@ -325,6 +330,70 @@ fn add_csv(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
             p["delimiter"] = json!(app.dialogs.mode);
         }
         app.run("ui.addDelimited", p).map(|_| ())
+    })
+}
+
+/// Add From Database: a PostgreSQL/PostGIS connection (or a DuckDB file), its password (kept for
+/// the session only) and one table or all of them.
+fn add_database(app: &mut RustGisApp, ui: &mut egui::Ui) -> bool {
+    ui.label(egui::RichText::new(tl!("A PostgreSQL connection (host=… port=… dbname=… user=…, or a postgresql:// address) or a DuckDB file. Read through DuckDB; the password is kept until RustGIS closes, never in the project.")).weak());
+    // A bare connection string is a PostgreSQL one.
+    let database = |a: &str| {
+        let a = a.trim();
+        if a.contains('=') && !a.contains("://") && !a.to_ascii_lowercase().starts_with("postgres:") {
+            format!("postgres:{a}")
+        } else {
+            a.to_string()
+        }
+    };
+    let mut list = false;
+    egui::Grid::new("database").num_columns(2).spacing(vec2(10.0, 8.0)).show(ui, |ui| {
+        ui.label(tl!("Connection"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.a).hint_text("host=localhost dbname=gis user=postgres").desired_width(280.0));
+        ui.end_row();
+        ui.label(tl!("Password"));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.dialogs.b).password(true).hint_text(tl!("none, or from PGPASSWORD")).desired_width(280.0),
+        );
+        ui.end_row();
+        ui.label(tl!("Table"));
+        ui.horizontal(|ui| {
+            let shown = if app.dialogs.c.is_empty() { tl!("All tables with geometry").to_string() } else { app.dialogs.c.clone() };
+            egui::ComboBox::from_id_salt("db_table").selected_text(shown).width(190.0).show_ui(ui, |ui| {
+                ui.selectable_value(&mut app.dialogs.c, String::new(), tl!("All tables with geometry"));
+                for t in app.dialogs.list.clone() {
+                    ui.selectable_value(&mut app.dialogs.c, t.clone(), t);
+                }
+            });
+            list = ui.button(tl!("List Tables")).clicked();
+        });
+        ui.end_row();
+        ui.label(tl!("Coordinate system"));
+        ui.add(egui::TextEdit::singleline(&mut app.dialogs.text).hint_text(tl!("of a geometry that doesn't say")).desired_width(280.0));
+        ui.end_row();
+    });
+    if list {
+        let p = json!({"database": database(&app.dialogs.a), "password": app.dialogs.b});
+        match app.run("info.databaseTables", p) {
+            Ok(v) => {
+                app.dialogs.list = v["layers"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)).collect();
+                app.dialogs.error = None;
+                app.dialogs.info = Some(crate::i18n::fmt("{n} tables with geometry", &[("n", &app.dialogs.list.len().to_string())]));
+            }
+            Err(e) => {
+                app.dialogs.info = None;
+                app.dialogs.error = Some(e);
+            }
+        }
+    }
+    buttons(app, ui, "Add", |app| {
+        let mut p = json!({"database": database(&app.dialogs.a), "password": app.dialogs.b});
+        for (key, v) in [("layer", &app.dialogs.c), ("crs", &app.dialogs.text)] {
+            if !v.trim().is_empty() {
+                p[key] = json!(v.trim());
+            }
+        }
+        app.run("layer.addDatabase", p).map(|_| ())
     })
 }
 

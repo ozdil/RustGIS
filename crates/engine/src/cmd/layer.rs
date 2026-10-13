@@ -17,8 +17,14 @@ pub fn commands() -> Vec<C> {
             .view()
             .params(r#"{"path": string}"#),
         C::new("layer.addSql", "Add Data From SQL", "Home › Add", add_sql).params(
-            r#"{"sql": "one DuckDB SELECT; DuckDB Spatial's ST_ functions, read_parquet('…'), web addresses", "name"?: string, "database"?: "a .duckdb file whose tables the query names", "crs"?: "EPSG:… of a geometry that doesn't say", "stream"?: bool}"#,
+            r#"{"sql": "one DuckDB SELECT; DuckDB Spatial's ST_ functions, read_parquet('…'), web addresses", "name"?: string, "database"?: "a .duckdb file or a PostgreSQL connection (postgres:host=… dbname=…) whose tables the query names", "password"?: "the connection's, kept for this session only", "crs"?: "EPSG:… of a geometry that doesn't say", "stream"?: bool}"#,
         ),
+        C::new("layer.addDatabase", "Add Data From Database", "Home › Add", add_database).params(
+            r#"{"database": "postgres:host=… dbname=… user=… (or a postgresql:// address), or a .duckdb file", "password"?: "kept for this session only, never saved", "layer"?: "a table, as table or schema.table (default: every table with a geometry column)", "crs"?: "EPSG:… of a geometry that doesn't say", "name"?: string, "stream"?: bool}"#,
+        ),
+        C::new("info.databaseTables", "List Database Tables", "Home › Add › Add Data From Database", database_tables)
+            .view()
+            .params(r#"{"database": "as layer.addDatabase", "password"?: string}"#),
         C::new("layer.loadAll", "Load All Features", "Layers", load_all).when(need_streamed).params(r#"{"layer"?: name|id}"#),
         C::new("layer.addDataText", "Add Data (from text)", "Home › Add", add_data_text).params(r#"{"fileName": "name.geojson|.csv|.tsv", "text": string, "name"?: text, "x"?, "y"?, "wkt"?, "crs"?, "delimiter"? (as layer.addData, for delimited text)}"#),
         C::new("layer.addSample", "Add Sample Data", "Home › Add › Add Data", add_sample).params(r#"{"name": "countries"|"cities"|"rivers"|"lakes"}"#),
@@ -301,7 +307,7 @@ fn add_data(s: &mut Session, p: &Value) -> CmdResult {
     }
     #[cfg(not(target_arch = "wasm32"))]
     if rustgis_data::source::duckdb::is_duckdb_name(path) {
-        return add_duckdb(s, p, path);
+        return add_tables(s, p, &rustgis_data::source::duckdb::Database::File(path.into()));
     }
     if rustgis_data::io::is_multi_layer_name(path) {
         let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
@@ -639,17 +645,70 @@ fn add_gdal(s: &mut Session, p: &Value, path: &str) -> CmdResult {
     add_converted(s, p, path, &original, parts)
 }
 
-/// Adds the tables of a DuckDB database that have a geometry column (or the one `layer` names),
-/// each converted once into GeoParquet in the cache.
+/// The database a command names in `database`, with the `password` given remembered for the
+/// session.
 #[cfg(not(target_arch = "wasm32"))]
-fn add_duckdb(s: &mut Session, p: &Value, path: &str) -> CmdResult {
-    use rustgis_data::source::duckdb;
+fn database_param(p: &Value) -> Option<rustgis_data::source::duckdb::Database> {
+    use rustgis_data::source::duckdb::{Database, remember_password};
+    let d = ps(p, "database").map(str::trim).filter(|d| !d.is_empty())?;
+    let db = match Database::parse(d) {
+        Database::File(f) => Database::File(std::path::absolute(&f).unwrap_or(f)),
+        pg => pg,
+    };
+    if let (Database::Postgres(dsn), Some(pw)) = (&db, ps(p, "password").filter(|pw| !pw.is_empty())) {
+        remember_password(dsn, pw);
+    }
+    Some(db)
+}
+
+/// The tables of a database (a PostgreSQL connection or a DuckDB file) that have a geometry column.
+fn database_tables(_s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = p;
+        Err("databases are read through DuckDB in the desktop app".into())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let db = database_param(p).ok_or("database is required")?;
+        let tables = rustgis_data::source::duckdb::tables_of(&db).map_err(|e| format!("{}: {e}", db.short()))?;
+        let layers: Vec<String> = tables.iter().map(|t| t.label()).collect();
+        Ok(json!({"count": layers.len(), "layers": layers}))
+    }
+}
+
+/// Adds the tables of a database (a PostgreSQL connection or a DuckDB file) that have a geometry
+/// column, or the one `layer` names.
+fn add_database(s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (s, p);
+        Err("databases are read through DuckDB in the desktop app".into())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let db = database_param(p).ok_or("database is required")?;
+        add_tables(s, p, &db)
+    }
+}
+
+/// Adds the tables of a database that have a geometry column (or the one `layer` names): a
+/// DuckDB file's each converted once into GeoParquet in the cache, a connection's afresh.
+#[cfg(not(target_arch = "wasm32"))]
+fn add_tables(s: &mut Session, p: &Value, db: &rustgis_data::source::duckdb::Database) -> CmdResult {
+    use rustgis_data::source::duckdb::{self, Database};
     let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
-    let db = Path::new(path);
+    let (path, original) = match db {
+        Database::File(f) => {
+            (f.display().to_string(), std::path::absolute(f).map(|p| p.display().to_string()).unwrap_or_else(|_| f.display().to_string()))
+        }
+        Database::Postgres(_) => (db.short(), db.label()),
+    };
+    let path = path.as_str();
     let err = |e: rustgis_data::DataError| format!("{path}: {e}");
     let tables = match ps(p, "layer").map(str::trim).filter(|l| !l.is_empty()) {
-        Some(l) => vec![duckdb::find_table(db, l).map_err(err)?],
-        None => duckdb::tables(db).map_err(err)?,
+        Some(l) => vec![duckdb::find_table_of(db, l).map_err(err)?],
+        None => duckdb::tables_of(db).map_err(err)?,
     };
     if tables.is_empty() {
         return Err(format!("{path}: no tables with a geometry column"));
@@ -659,12 +718,17 @@ fn add_duckdb(s: &mut Session, p: &Value, path: &str) -> CmdResult {
     let mut tables = tables;
     let skipped: Vec<String> =
         if total > duckdb::MAX_TABLES { tables.split_off(duckdb::MAX_TABLES).iter().map(|t| t.label()).collect() } else { Vec::new() };
-    let original = std::path::absolute(path).map(|p| p.display().to_string()).unwrap_or_else(|_| path.to_string());
     let mut parts = Vec::new();
+    let mut empty = 0usize;
     let single = tables.len() == 1;
     for t in tables {
-        let out = match duckdb::convert_table(db, &t, crs) {
+        let out = match duckdb::convert_table_of(db, &t, crs) {
             Ok(o) => o,
+            // Empty tables (common in a PostGIS database: its TIGER geocoder's) are left out quietly.
+            Err(rustgis_data::DataError::Format(m)) if !single && m == duckdb::NO_ROWS => {
+                empty += 1;
+                continue;
+            }
             // A table that fails doesn't stop the others.
             Err(e) if !single => {
                 s.notify(format!("{path}: {}: {e}", t.label()), true);
@@ -681,8 +745,14 @@ fn add_duckdb(s: &mut Session, p: &Value, path: &str) -> CmdResult {
         };
         parts.extend(duckdb_parts(s, &t.label(), out, origin));
     }
+    if parts.is_empty() && empty > 0 {
+        return Err(format!("{path}: the tables with a geometry column are empty"));
+    }
     let mut out = add_converted(s, p, path, &original, parts)?;
     // Said once the tables are in: a failure above is the error instead.
+    if empty > 0 {
+        s.notify(format!("{path}: {empty} empty tables were left out"), false);
+    }
     if !skipped.is_empty() {
         s.notify(
             format!(
@@ -710,9 +780,9 @@ fn add_sql(s: &mut Session, p: &Value) -> CmdResult {
     {
         use rustgis_data::source::duckdb;
         let crs = ps(p, "crs").map(str::trim).filter(|c| !c.is_empty());
-        let database = ps(p, "database").map(str::trim).filter(|d| !d.is_empty());
-        let full = database.map(|d| std::path::absolute(d).map(|p| p.display().to_string()).unwrap_or_else(|_| d.to_string()));
-        let q = duckdb::Query { sql, database: database.map(Path::new), crs };
+        let database = database_param(p);
+        let full = database.as_ref().map(|d| d.label());
+        let q = duckdb::Query { sql, database: database.as_ref(), crs };
         let out = duckdb::run(&q).map_err(|e| e.to_string())?;
         let name = ps(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Query");
         let origin = |family| rustgis_map::source::DuckdbOrigin {
